@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/zsh
 
 # --- Configuration ---
 SAMPLE_RATE=48000

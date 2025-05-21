@@ -5,14 +5,14 @@ REM --- Configuration ---
 set MAC_IP=192.168.0.125
 set SAMPLE_RATE=48000
 set PERIOD_SIZE=128
+REM NUM_PERIODS will be used for jack_netsource's network latency option
 set NUM_PERIODS=2
 set NETJACK_PORT=19000
 
-REM IMPORTANT: Set this to the exact name of your Windows audio device that you want to send FROM,
-REM as JACK sees it. Use "jack_lsp -A" in a separate command prompt after jackd has started
-REM to list available audio ports if you are unsure.
-REM VB-Audio Cable is often "CABLE Output (VB-Audio Virtual Cable)" or similar.
-set AUDIO_SOURCE_JACK_CAPTURE_PREFIX="CABLE Output (VB-Audio Virtual Cable)"
+REM IMPORTANT: Based on jack_lsp -A output, the system audio source ports are "system:capture_X"
+set AUDIO_SOURCE_CLIENT_NAME="system"
+set AUDIO_SOURCE_PORT_1="capture_1"
+set AUDIO_SOURCE_PORT_2="capture_2"
 
 REM --- Set Path to JACK Installation ---
 REM Adjust this path if JACK2 is installed in a different location.
@@ -51,14 +51,13 @@ set PATH=%PATH%;%JACK_INSTALL_DIR%;%JACK_INSTALL_DIR%\tools;%JACK_INSTALL_DIR%\j
 echo Starting JACK server on Windows...
 REM -R for real-time priority (if possible)
 REM -P99 for high priority (Windows specific)
-REM -d portaudio (default, can be changed to -d dsound or -d asio -D "Your ASIO Driver Name" for potentially lower latency)
+REM -d portaudio
 REM -r sample rate
 REM -p period size (buffer size for jackd)
-REM -n number of periods
 REM -D for duplex mode (input and output)
 REM -o 2 for 2 output channels (stereo) - jackd needs to know its own output channels
-REM -v for verbose output
-start "JACKD_Server" /B jackd.exe -R -P99 -v -d portaudio -r %SAMPLE_RATE% -p %PERIOD_SIZE% -n %NUM_PERIODS% -D -o 2
+REM -v for verbose output (this is a general jackd option)
+start "JACKD_Server" /B jackd.exe -R -P99 -v -d portaudio -r %SAMPLE_RATE% -p %PERIOD_SIZE% -D -o 2
 
 echo Waiting for JACK server to initialize (5 seconds)...
 timeout /t 5 /nobreak >nul
@@ -69,35 +68,25 @@ jack_lsp.exe -A
 echo.
 
 echo Starting NetJack sender to Mac (%MAC_IP%)...
-REM jack_netsource will create input ports like "NetJack/send_1", "NetJack/send_2"
 REM -H target host IP
-REM -p target host port (lowercase 'p' for port with jack_netsource)
-REM -q quality (0=raw PCM, 1=opus) - Opus might add slight latency but save bandwidth. Raw PCM for lowest latency.
+REM -p target host port
 REM -r sample rate (must match jackd)
-REM -P period size (uppercase 'P' for period with jack_netsource, must match jackd's period size)
-REM -n number of channels to send (stereo)
-REM -a async mode (0=off, 1=on) - async might help with network jitter but can add latency. Start with 0.
-REM -v for verbose output
-start "NetJack_Sender" /B jack_netsource.exe -v -H %MAC_IP% -p %NETJACK_PORT% -q 0 -r %SAMPLE_RATE% -P %PERIOD_SIZE% -n 2 -a 0
+REM -i number of audio channels to capture and send (stereo = 2)
+REM -n network latency in JACK periods (use NUM_PERIODS from config)
+start "NetJack_Sender" /B jack_netsource.exe -H %MAC_IP% -p %NETJACK_PORT% -r %SAMPLE_RATE% -i 2 -n %NUM_PERIODS%
 
-echo Waiting for NetJack sender to initialize and create ports (3 seconds)...
-timeout /t 3 /nobreak >nul
+echo Waiting for NetJack sender to initialize and create ports (5 seconds)...
+timeout /t 5 /nobreak >nul
 
 echo.
 echo Attempting to connect audio source to NetJack sender ports...
-echo Source Prefix: %AUDIO_SOURCE_JACK_CAPTURE_PREFIX%
-echo Destination: NetJack input ports (e.g., NetJack/send_1)
+echo Source: %AUDIO_SOURCE_CLIENT_NAME%:%AUDIO_SOURCE_PORT_1% and %AUDIO_SOURCE_CLIENT_NAME%:%AUDIO_SOURCE_PORT_2%
+echo Destination: netjack:capture_1 and netjack:capture_2
 echo.
 
-REM VB-Cable output often appears as JACK capture ports.
-REM NetJack sender creates input ports, typically named "NetJack/send_1" and "NetJack/send_2".
-REM Use jack_lsp.exe -c to see actual port names if connections fail.
-jack_connect.exe "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:capture_1" "NetJack/send_1"
-jack_connect.exe "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:capture_2" "NetJack/send_2"
-
-REM Alternative common naming for VB-Cable if the above fails
-jack_connect.exe "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:Out 1" "NetJack/send_1"
-jack_connect.exe "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:Out 2" "NetJack/send_2"
+REM Connect the system capture ports to netjack's input ports
+jack_connect.exe "%AUDIO_SOURCE_CLIENT_NAME%:%AUDIO_SOURCE_PORT_1%" "netjack:capture_1"
+jack_connect.exe "%AUDIO_SOURCE_CLIENT_NAME%:%AUDIO_SOURCE_PORT_2%" "netjack:capture_2"
 
 echo.
 echo Current JACK connections:
@@ -106,8 +95,8 @@ echo.
 echo NetJack sender should be running.
 echo If audio is not transmitting, please verify connections using a JACK patchbay
 echo (like QjackCtl, Catia from Cadence, or Patchage).
-echo Ensure your audio source (e.g., %AUDIO_SOURCE_JACK_CAPTURE_PREFIX% output ports)
-echo is connected to NetJack's input ports (e.g., 'NetJack/send_1', 'NetJack/send_2').
+echo Ensure '%AUDIO_SOURCE_CLIENT_NAME%:%AUDIO_SOURCE_PORT_1%' is connected to 'netjack:capture_1'
+echo and '%AUDIO_SOURCE_CLIENT_NAME%:%AUDIO_SOURCE_PORT_2%' is connected to 'netjack:capture_2'.
 echo.
 echo To stop: Close the JACKD_Server and NetJack_Sender console windows, or press Ctrl+C in them.
 echo Pressing any key here will exit this script, but JACK and NetJack may continue running.
