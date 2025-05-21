@@ -1,4 +1,3 @@
-// filepath: /Users/reyneardouglas/WindowsToMacSpeaker/Jack Audio + NetJack Implementation/Windows/start_jack_sender.bat
 @echo off
 setlocal
 
@@ -18,19 +17,36 @@ set AUDIO_SOURCE_JACK_CAPTURE_PREFIX="CABLE Output (VB-Audio Virtual Cable)"
 REM --- Set Path to JACK Installation ---
 REM Adjust this path if JACK2 is installed in a different location.
 set "JACK_INSTALL_DIR=C:\Program Files\JACK2"
-if not exist "%JACK_INSTALL_DIR%\bin\jackd.exe" (
+if not exist "%JACK_INSTALL_DIR%\jackd.exe" (
     set "JACK_INSTALL_DIR=C:\Program Files (x86)\JACK2"
     if not exist "%JACK_INSTALL_DIR%\jackd.exe" (
-        echo ERROR: JACK2 executables not found in "%ProgramFiles%\JACK2" or "%ProgramFiles(x86)%\JACK2\bin".
+        echo ERROR: jackd.exe not found in "%ProgramFiles%\JACK2" or "%ProgramFiles(x86)%\JACK2".
         echo Please install JACK2 from https://jackaudio.org/downloads/
         echo or update the JACK_INSTALL_DIR variable in this script.
         pause
         exit /b 1
     )
 )
+
+REM Check for the 'tools' directory where other executables are expected
+if not exist "%JACK_INSTALL_DIR%\tools\jack_netsource.exe" (
+    echo ERROR: jack_netsource.exe not found in "%JACK_INSTALL_DIR%\tools".
+    echo Please ensure JACK2 tools are correctly installed in a 'tools' subdirectory.
+    pause
+    exit /b 1
+)
+
+REM Check for the 'jack' subdirectory where DLLs are expected
+if not exist "%JACK_INSTALL_DIR%\jack\jack.dll" (
+    echo ERROR: jack.dll not found in "%JACK_INSTALL_DIR%\jack".
+    echo Please ensure JACK2 DLLs are correctly installed in a 'jack' subdirectory.
+    pause
+    exit /b 1
+)
+
 echo Using JACK from: %JACK_INSTALL_DIR%
-set PATH=%PATH%;%JACK_INSTALL_DIR%
-set PATH=%PATH%;%JACK_INSTALL_DIR%\tools
+REM Add main JACK directory (for jackd.exe), tools directory, and jack (DLL) directory to PATH
+set PATH=%PATH%;%JACK_INSTALL_DIR%;%JACK_INSTALL_DIR%\tools;%JACK_INSTALL_DIR%\jack
 
 echo Starting JACK server on Windows...
 REM -R for real-time priority (if possible)
@@ -76,16 +92,16 @@ echo.
 REM VB-Cable output often appears as JACK capture ports.
 REM NetJack sender creates input ports, typically named "NetJack/send_1" and "NetJack/send_2".
 REM Use jack_lsp.exe -c to see actual port names if connections fail.
-jack_connect "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:capture_1" "NetJack/send_1"
-jack_connect "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:capture_2" "NetJack/send_2"
+jack_connect.exe "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:capture_1" "NetJack/send_1"
+jack_connect.exe "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:capture_2" "NetJack/send_2"
 
 REM Alternative common naming for VB-Cable if the above fails
-jack_connect "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:Out 1" "NetJack/send_1"
-jack_connect "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:Out 2" "NetJack/send_2"
+jack_connect.exe "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:Out 1" "NetJack/send_1"
+jack_connect.exe "%AUDIO_SOURCE_JACK_CAPTURE_PREFIX%:Out 2" "NetJack/send_2"
 
 echo.
 echo Current JACK connections:
-jack_lsp -c
+jack_lsp.exe -c
 echo.
 echo NetJack sender should be running.
 echo If audio is not transmitting, please verify connections using a JACK patchbay
