@@ -5,4 +5,4 @@ c=IN IP4 192.168.0.125
 t=0 0
 m=audio 5004 RTP/AVP 97
 a=rtpmap:97 OPUS/48000/2
-a=fmtp:97 useinbandfec=1
+a=fmtp:97 minptime=10; useinbandfec=1; maxptime=20
