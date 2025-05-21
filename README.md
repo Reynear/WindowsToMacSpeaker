@@ -1,2 +1,4 @@
 # WindowsToMacSpeaker
-Allows audio playback form a Windows PC to a MacOS device using FFmpeg and the RTP protocol.  
+Allows audio playback form a Windows PC to a MacOS device using multiple protocols.
+- FFmpeg and the RTP protocol
+- JackAudio + NetJack  
