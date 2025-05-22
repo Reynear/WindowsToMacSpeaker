@@ -1,8 +1,15 @@
 v=0
-o=- 0 0 IN IP4 0.0.0.0
-s=FFmpeg Audio Stream
+o=- 0 0 IN IP4 192.168.0.125
+s=Windows to Mac Audio Stream - Buffered
 c=IN IP4 192.168.0.125
 t=0 0
+a=tool:ffmpeg
+a=type:broadcast
 m=audio 5004 RTP/AVP 97
 a=rtpmap:97 OPUS/48000/2
-a=fmtp:97 minptime=10; useinbandfec=1; maxptime=20
+a=fmtp:97 minptime=20; maxptime=60; useinbandfec=1; stereo=1; sprop-stereo=1
+a=ptime:20
+a=maxptime:60
+a=sendrecv
+a=rtcp:5005
+a=setup:passive
