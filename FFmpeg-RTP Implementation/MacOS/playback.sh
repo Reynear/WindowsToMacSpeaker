@@ -1,20 +1,43 @@
 #!/bin/zsh
+# filepath: /Users/reyneardouglas/WindowsToMacSpeaker/FFmpeg-RTP Implementation/MacOS/playback.sh
 
-
-# Enhanced FFmpeg RTP Audio Receiver for macOS
-# Optimized for low latency audio streaming
+# FFmpeg RTP Audio Receiver for macOS
 
 # Configuration
 SDP_FILE="$(dirname "$0")/stream.sdp"
 LOG_FILE="$(dirname "$0")/playback.log"
-AUDIO_DEVICE="default"  # Can be changed to specific device
+RTP_PORT=5004
 
 echo "FFmpeg RTP Audio Receiver"
 echo "========================"
 echo "SDP File: $SDP_FILE"
-echo "Log File: $LOG_FILE"
-echo "Audio Device: $AUDIO_DEVICE"
+echo "RTP Port: $RTP_PORT"
 echo
+
+# Function to kill processes using the port
+free_port() {
+    local port=$1
+    local pids=$(lsof -ti :$port 2>/dev/null)
+    if [ -n "$pids" ]; then
+        echo "Freeing port $port..."
+        echo $pids | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+}
+
+# Cleanup function
+cleanup() {
+    echo "Cleaning up..."
+    pkill -f "ffplay.*$SDP_FILE" 2>/dev/null || true
+    free_port $RTP_PORT
+    exit 0
+}
+
+# Set up signal handlers
+trap cleanup INT TERM EXIT
+
+# Free port if in use
+free_port $RTP_PORT
 
 # Validate SDP file exists
 if [ ! -f "$SDP_FILE" ]; then
@@ -28,58 +51,33 @@ echo
 
 # Check for ffplay
 if ! command -v ffplay &> /dev/null; then
-    echo "ERROR: ffplay not found. Please install FFmpeg:"
-    echo "brew install ffmpeg"
+    echo "ERROR: ffplay not found. Install with: brew install ffmpeg"
     exit 1
 fi
 
-echo "FFmpeg version:"
-ffplay -version | head -1
-echo
-
-# List available audio devices (macOS specific)
-echo "Available audio devices:"
-ffplay -f avfoundation -list_devices true -i "" 2>&1 | grep -E "\[AVFoundation.*audio"
-echo
-
-# Start playback with enhanced low-latency settings
 echo "Starting audio playback..."
-echo "Press 'q' to quit, 'ESC' to quit"
+echo "Press Ctrl+C to quit"
 echo
 
-# Log startup
-{
-    echo "Starting FFplay audio receiver at $(date)"
-    echo "SDP: $SDP_FILE"
-    echo "Device: $AUDIO_DEVICE"
-    echo
-} > "$LOG_FILE"
-
-# Start ffplay with low-latency settings
-# Note: Adjust buffer size and latency settings as needed
-ffplay -protocol_whitelist file,udp,rtp -i stream.sdp \
-  -buffer_size 65536 \
-  -max_delay 500000 \
-  -reorder_queue_size 500 \
+# Start ffplay
+ffplay -protocol_whitelist file,udp,rtp -i "$SDP_FILE" \
+  -buffer_size 32768 \
+  -max_delay 200000 \
   -fflags +genpts+igndts \
   -flags +low_delay \
-  -avoid_negative_ts make_zero \
-  -use_wallclock_as_timestamps 1 \
-  -thread_queue_size 1024 \
-  -nodisp
+  -sync audio \
+  -autoexit \
+  -nodisp \
+  -loglevel warning 2>&1 | tee "$LOG_FILE" &
 
+FFPLAY_PID=$!
+wait $FFPLAY_PID
 FFPLAY_EXIT=$?
-echo
-echo "FFplay exited with code: $FFPLAY_EXIT"
 
-if [ $FFPLAY_EXIT -ne 0 ]; then
-    echo "ERROR: Audio playback failed. Check log: $LOG_FILE"
+if [ $FFPLAY_EXIT -ne 0 ] && [ $FFPLAY_EXIT -ne 130 ]; then
+    echo "ERROR: Playback failed. Check log: $LOG_FILE"
     echo "Common issues:"
-    echo "- No audio stream received from Windows"
-    echo "- Network connectivity problems"
-    echo "- Audio device conflicts"
-    echo "- Firewall blocking UDP port 5004"
+    echo "- No stream from Windows sender"
+    echo "- Network connectivity problems" 
+    echo "- Firewall blocking UDP port $RTP_PORT"
 fi
-
-echo "Press Enter to exit..."
-read
