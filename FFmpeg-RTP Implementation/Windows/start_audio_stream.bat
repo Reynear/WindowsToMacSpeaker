@@ -17,10 +17,7 @@ set "MAC_IP=192.168.0.125"
 set "AUDIO_DEV=CABLE Output (VB-Audio Virtual Cable)"
 set "RTP_PORT=5004"
 set "BITRATE=128k"
-set "LOG_DIR=%~dp0logs"
-
-REM Create logs directory
-if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+set "LOG_DIR=%~dp0"
 set "LOG_FILE=%LOG_DIR%\audio_stream.log"
 
 echo Configuration:
@@ -128,7 +125,9 @@ ffmpeg -hide_banner -f dshow -i audio="%AUDIO_DEV%" ^
 -fflags nobuffer -flags low_delay ^
 -max_delay 0 ^
 -flush_packets 1 ^
--f rtp "rtp://%MAC_IP%:%RTP_PORT%" 2>>"%LOG_FILE%"
+-f rtp "rtp://%MAC_IP%:%RTP_PORT%" ^
+-progress "%LOG_DIR%\audio_stream_progress.txt" ^
+-stats 2>>"%LOG_FILE%"
 
 REM This will only execute if FFmpeg exits (stopped or error)
 echo.
