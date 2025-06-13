@@ -203,6 +203,9 @@ class UDPReceiver:
     
     def init_csv_logging(self):
         """Initialize CSV logging"""
+        # CSV logging disabled to prevent zero_loss_metrics.csv creation
+        return
+        
         if not self.config['logging']['enable_csv']:
             return
             
@@ -374,6 +377,14 @@ class UDPReceiver:
                 if len(self.audio_queue) > 0:
                     audio_data = self.audio_queue.popleft()  # Use popleft() for deque
                     
+                    # Convert bytes to numpy array if needed
+                    if isinstance(audio_data, bytes):
+                        audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                        audio_data = audio_array.astype(np.float32) / 32767.0
+                      # Ensure audio_data is a numpy array
+                    if not isinstance(audio_data, np.ndarray):
+                        return  # Skip invalid data
+                    
                     # Ensure proper shape for multi-channel audio
                     if audio_data.ndim == 1:
                         if self.channels == 2:
@@ -478,7 +489,8 @@ class UDPReceiver:
                     # Convert to numpy array
                     audio_array = np.frombuffer(pcm_data, dtype=np.int16)
                     audio_float = audio_array.astype(np.float32) / 32767.0
-                      # Add to playback queue
+                    
+                    # Add to playback queue
                     with self.queue_lock:
                         if len(self.audio_queue) < self.max_queue_size:
                             self.audio_queue.append(audio_float)
@@ -643,13 +655,16 @@ class UDPReceiver:
             
             # Update packet timing metrics
             self.last_packet_time = receive_time
-            self.packet_timestamps.append(receive_time)
-              # Extract and decode audio payload immediately
+            self.packet_timestamps.append(receive_time)            # Extract and decode audio payload immediately
             payload = data[12:]  # Skip UDP header
             
             if len(payload) > 0:
                 # Decode Opus audio with minimal delay
-                audio_float = self.opus_decoder.decode_float(payload, self.frame_samples)
+                pcm_data = self.opus_decoder.decode(payload, frame_size=self.frame_samples)
+                
+                # Convert to numpy array
+                audio_array = np.frombuffer(pcm_data, dtype=np.int16)
+                audio_float = audio_array.astype(np.float32) / 32767.0
                 
                 # Add to audio queue with overflow protection
                 with self.queue_lock:
