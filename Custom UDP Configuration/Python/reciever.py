@@ -123,9 +123,9 @@ class UDPReceiver:
         # Jitter calculation attributes
         self.transit_times = []
         self.jitter = 0.0
-        
-        # Adaptive jitter buffer management
-        self.adaptive_jitter_size = self.config['optimization']['jitter_buffer_size']
+          # Adaptive jitter buffer management
+        optimization_config = self.config.get('optimization', {})
+        self.adaptive_jitter_size = optimization_config.get('jitter_buffer_size', 5)
         self.jitter_buffer_min = 1
         self.jitter_buffer_max = 10
         self.network_jitter = 0.0
@@ -152,10 +152,8 @@ class UDPReceiver:
         self.init_csv_logging()
         
         # Set remaining config values
-        self.max_queue_size = self.config['audio'].get('buffer_frames', 10)
-        
-        # Jitter buffer (in packets)
-        jitter_size = self.config['optimization']['jitter_buffer_size']
+        self.max_queue_size = self.config['audio'].get('buffer_frames', 10)        # Jitter buffer (in packets)
+        jitter_size = self.config.get('optimization', {}).get('jitter_buffer_size', 5)
         self.jitter_buffer = deque(maxlen=jitter_size)
         
     def load_config(self, config_file):
@@ -163,11 +161,22 @@ class UDPReceiver:
         if not os.path.exists(config_file):
             print(f"Error: config file '{config_file}' not found.")
             sys.exit(1)
+        
         try:
             with open(config_file, 'r') as f:
                 config = json.load(f)
+                # Debug: Check if optimization section exists
+                if 'optimization' not in config:
+                    print(f"⚠️  Warning: 'optimization' section missing from config. Using defaults.")
+                    config['optimization'] = {
+                        'jitter_buffer_size': 5,
+                        'enable_adaptive_bitrate': True,
+                        'enable_jitter_buffer': True,
+                        'max_retries': 2,
+                        'timing_tolerance_ms': 5
+                    }
         except Exception as e:
-            print(f"Error reading config file: {e}")
+            print(f"❌ Error reading config file: {e}")
             sys.exit(1)
         return config
 
@@ -395,8 +404,8 @@ class UDPReceiver:
                         outdata[:fade_samples] = concealed_audio
                     
                     self.buffer_underruns += 1
-                    if self.config['logging']['verbose']:
-                        print(f"🔇 Audio buffer empty - concealment applied")
+                    if self.config['logging']['verbose'] and self.buffer_underruns % 100 == 0:
+                        print(f"🔇 Audio buffer empty ({self.buffer_underruns} underruns) - concealment applied")
             
             # Store last frame for concealment
             if len(outdata) > 0:

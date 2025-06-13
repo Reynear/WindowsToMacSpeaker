@@ -537,7 +537,7 @@ class UltraLowLatencyUDPSender:
         return False
 
     def log_enhanced_metrics(self, pcm_bytes, opus_data, capture_timestamp):
-        """Log enhanced metrics with ultra-low latency statistics"""
+        """Log enhanced metrics with statistics"""
         try:
             elapsed = time.perf_counter() - (self.start_time or time.perf_counter())
             rate = self.packet_count / elapsed if elapsed > 0 else 0
