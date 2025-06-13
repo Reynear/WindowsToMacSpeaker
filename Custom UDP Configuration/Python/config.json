@@ -7,11 +7,12 @@
     "sample_rate": 24000,
     "channels": 2,
     "chunk_size": 960,
-    "buffer_frames": 10,
+    "buffer_frames": 30,
     "input_device_id": null,
     "input_device_name": "VB-Audio",
     "output_device_id": null,
-    "output_device_name": "default"  },
+    "output_device_name": "default"
+  },
   "opus": {
     "bitrate": 64000,
     "frame_duration": 20
@@ -23,11 +24,10 @@
     "receiver_csv_file": "receiver_metrics.csv",
     "enable_csv": true,
     "csv_file": "zero_loss_metrics.csv"
-  },
-  "optimization": {
+  },  "optimization": {
     "enable_adaptive_bitrate": true,
     "enable_jitter_buffer": true,
-    "jitter_buffer_size": 5,
+    "jitter_buffer_size": 8,
     "max_retries": 2,
     "timing_tolerance_ms": 5
   }

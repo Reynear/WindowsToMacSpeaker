@@ -92,17 +92,25 @@ class UDPReceiver:
         
         # Initialize socket
         self.sock = None
-        self.init_socket()        # Control flags
+        self.init_socket()
+        
+        # Control flags
         self.receiving = False
         self.packet_count = 0
-        self.start_time = None
-        
-        # Audio buffering with thread-safe access
-        self.audio_queue = deque(maxlen=20)  # Fast access buffer
+        self.start_time = None        # Audio buffering with thread-safe access (optimized for ultra-low latency and zero underruns)
+        self.max_queue_size = self.config['audio'].get('buffer_frames', 30)  # Configurable buffer size
+        self.audio_queue = deque(maxlen=self.max_queue_size)  
         self.queue_lock = threading.Lock()  # Thread synchronization
-        self.max_queue_size = 20
-        self.playback_buffer = deque(maxlen=10)  # Additional fast access buffer
-        self.buffer_lock = threading.Lock()
+        
+        # Buffer management for smooth playback
+        self.min_buffer_size = max(3, self.max_queue_size // 6)  # Dynamic minimum based on max size
+        self.target_buffer_size = max(8, self.max_queue_size // 3)  # Dynamic target
+        self.prefill_buffer_size = max(12, self.max_queue_size // 2)  # Pre-fill before starting
+        
+        # Buffer state tracking
+        self.buffer_state = "initializing"  # "initializing", "pre_filling", "playing", "recovering"
+        self.consecutive_underruns = 0
+        self.buffer_health_score = 100  # 0-100, tracks buffer stability
         
         # Advanced performance tracking
         self.packets_received = 0
@@ -123,7 +131,8 @@ class UDPReceiver:
         # Jitter calculation attributes
         self.transit_times = []
         self.jitter = 0.0
-          # Adaptive jitter buffer management
+        
+        # Adaptive jitter buffer management
         optimization_config = self.config.get('optimization', {})
         self.adaptive_jitter_size = optimization_config.get('jitter_buffer_size', 5)
         self.jitter_buffer_min = 1
@@ -138,21 +147,27 @@ class UDPReceiver:
         self.expected_sequence = 1
         self.sequence_buffer = {}  # Out-of-order packet buffer
         self.max_sequence_gap = 5
-        
-        # Audio concealment for lost packets
+          # Audio concealment for lost packets
         self.last_audio_frame = None
         self.concealment_enabled = True
+          # Buffer initialization for smooth startup (improved)
+        self.buffer_initialized = False
+        self.startup_buffer_count = 0
+        self.playback_started = False
+        self.buffer_prefill_complete = False
         
         # Threading
         self.receive_thread = None
-          # CSV logging
+        
+        # CSV logging
         self.csv_file = self.config['logging'].get('csv_file', 'udp_receiver_metrics.csv')
         self.csv_writer = None
         self.csv_file_handle = None
         self.init_csv_logging()
+          # Set remaining config values (removed duplicate assignment)
+        # max_queue_size already set above based on config
         
-        # Set remaining config values
-        self.max_queue_size = self.config['audio'].get('buffer_frames', 10)        # Jitter buffer (in packets)
+        # Jitter buffer (in packets)
         jitter_size = self.config.get('optimization', {}).get('jitter_buffer_size', 5)
         self.jitter_buffer = deque(maxlen=jitter_size)
         
@@ -358,13 +373,12 @@ class UDPReceiver:
         if len(self.transit_times) > 1:
             d = abs(transit - self.transit_times[-2])
             self.jitter += (d - self.jitter) / 16.0
-        
-        # Keep only recent transit times
+          # Keep only recent transit times
         if len(self.transit_times) > 100:
             self.transit_times = self.transit_times[-50:]
     
     def audio_callback(self, outdata, frames, time_info, status):
-        """Audio playback callback with enhanced performance tracking"""
+        """Enhanced audio playback callback with zero-underrun buffer management"""
         callback_start = time.perf_counter()
         
         if status and self.config['logging']['verbose']:
@@ -374,16 +388,39 @@ class UDPReceiver:
         
         try:
             with self.queue_lock:
-                if len(self.audio_queue) > 0:
-                    audio_data = self.audio_queue.popleft()  # Use popleft() for deque
+                queue_size = len(self.audio_queue)
+                
+                # Buffer state management for smooth playback
+                if not self.playback_started:
+                    # Wait for buffer pre-fill before starting playback
+                    if queue_size >= self.prefill_buffer_size or self.buffer_prefill_complete:
+                        self.playback_started = True
+                        self.buffer_state = "playing"
+                        if self.config['logging']['verbose']:
+                            print(f"🎵 Playback started with {queue_size} frames pre-filled")
+                    else:
+                        # Still pre-filling, output silence
+                        return
+                
+                # Check for buffer recovery
+                if self.buffer_state == "recovering":
+                    if queue_size >= self.target_buffer_size:
+                        self.buffer_state = "playing"
+                        self.consecutive_underruns = 0
+                        if self.config['logging']['verbose']:
+                            print(f"✅ Buffer recovered with {queue_size} frames")
+                
+                # Play audio if buffer is healthy
+                if queue_size > 0 and self.buffer_state == "playing":
+                    audio_data = self.audio_queue.popleft()
                     
-                    # Convert bytes to numpy array if needed
-                    if isinstance(audio_data, bytes):
-                        audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                        audio_data = audio_array.astype(np.float32) / 32767.0
-                      # Ensure audio_data is a numpy array
+                    # Ensure audio_data is a numpy array
                     if not isinstance(audio_data, np.ndarray):
-                        return  # Skip invalid data
+                        if isinstance(audio_data, bytes):
+                            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                            audio_data = audio_array.astype(np.float32) / 32767.0
+                        else:
+                            return  # Skip invalid data
                     
                     # Ensure proper shape for multi-channel audio
                     if audio_data.ndim == 1:
@@ -395,32 +432,40 @@ class UDPReceiver:
                     samples_to_copy = min(len(audio_data), frames)
                     outdata[:samples_to_copy] = audio_data[:samples_to_copy]
                     
-                    # Advanced buffer monitoring and adaptation
-                    queue_size = len(self.audio_queue)
-                    if queue_size < 2:
-                        self.buffer_underruns += 1
-                        if self.config['logging']['verbose'] and self.buffer_underruns % 10 == 0:
-                            print(f"⚡ Buffer underrun #{self.buffer_underruns}: {queue_size} frames queued")
+                    # Update buffer health score
+                    if queue_size >= self.target_buffer_size:
+                        self.buffer_health_score = min(100, self.buffer_health_score + 2)
+                    elif queue_size < self.min_buffer_size:
+                        self.buffer_health_score = max(0, self.buffer_health_score - 5)
                     
-                    # Track audio timing precision
-                    self.track_audio_timing()
+                    # Store last frame for concealment
+                    self.last_audio_frame = outdata.copy()
                     
+                # Handle buffer underrun
                 else:
+                    self.buffer_underruns += 1
+                    self.consecutive_underruns += 1
+                    
+                    # Enter recovery mode if too many consecutive underruns
+                    if self.consecutive_underruns > 3 and self.buffer_state == "playing":
+                        self.buffer_state = "recovering"
+                        if self.config['logging']['verbose']:
+                            print(f"🔄 Entering buffer recovery mode (underruns: {self.consecutive_underruns})")
+                    
                     # Audio concealment for smooth playback during underruns
                     if self.last_audio_frame is not None and self.concealment_enabled:
-                        # Simple fade-out concealment
+                        # Advanced concealment with fade-out
                         fade_samples = min(frames, len(self.last_audio_frame))
-                        fade_factor = np.linspace(0.5, 0.0, fade_samples).reshape(-1, 1)
+                        fade_factor = np.linspace(0.3, 0.0, fade_samples).reshape(-1, 1)
                         concealed_audio = self.last_audio_frame[:fade_samples] * fade_factor
                         outdata[:fade_samples] = concealed_audio
                     
-                    self.buffer_underruns += 1
+                    # Reduced logging frequency for underruns
                     if self.config['logging']['verbose'] and self.buffer_underruns % 100 == 0:
-                        print(f"🔇 Audio buffer empty ({self.buffer_underruns} underruns) - concealment applied")
-            
-            # Store last frame for concealment
-            if len(outdata) > 0:
-                self.last_audio_frame = outdata.copy()
+                        print(f"⚡ Buffer underrun #{self.buffer_underruns}: {queue_size}/{self.max_queue_size} frames (health: {self.buffer_health_score}%)")
+                
+                # Track audio timing precision
+                self.track_audio_timing()
                 
         except Exception as e:
             self.audio_glitches += 1
@@ -431,7 +476,7 @@ class UDPReceiver:
         callback_duration = time.perf_counter() - callback_start
         if callback_duration > 0.005:  # Warn if callback takes >5ms
             self.timing_errors += 1
-            if self.config['logging']['verbose']:
+            if self.config['logging']['verbose'] and self.timing_errors % 50 == 0:
                 print(f"⏱️ Slow audio callback: {callback_duration*1000:.2f}ms")
     
     def receive_packets(self):
@@ -489,15 +534,32 @@ class UDPReceiver:
                     # Convert to numpy array
                     audio_array = np.frombuffer(pcm_data, dtype=np.int16)
                     audio_float = audio_array.astype(np.float32) / 32767.0
-                    
-                    # Add to playback queue
+                      # Add to playback queue with improved buffer management
                     with self.queue_lock:
-                        if len(self.audio_queue) < self.max_queue_size:
-                            self.audio_queue.append(audio_float)
+                        # Smart buffer management based on current state
+                        if self.buffer_state == "initializing" or self.buffer_state == "recovering":
+                            # During initialization/recovery, fill buffer more aggressively
+                            if len(self.audio_queue) < self.max_queue_size:
+                                self.audio_queue.append(audio_float)
+                                
+                                # Check if we've reached pre-fill threshold
+                                if not self.buffer_prefill_complete and len(self.audio_queue) >= self.prefill_buffer_size:
+                                    self.buffer_prefill_complete = True
+                                    if self.config['logging']['verbose']:
+                                        print(f"✅ Buffer pre-fill complete: {len(self.audio_queue)} frames")
+                            else:
+                                # Buffer full during init - drop oldest
+                                self.audio_queue.popleft()
+                                self.audio_queue.append(audio_float)
                         else:
-                            # Drop oldest frame for deque
-                            self.audio_queue.popleft()
-                            self.audio_queue.append(audio_float)
+                            # Normal playback - standard buffer management
+                            if len(self.audio_queue) < self.max_queue_size:
+                                self.audio_queue.append(audio_float)
+                            else:
+                                # Drop oldest frame for ultra-low latency
+                                self.audio_queue.popleft()
+                                self.audio_queue.append(audio_float)
+                                self.buffer_overruns += 1
                             
                 except Exception as e:
                     if self.config['logging']['verbose']:
@@ -665,16 +727,32 @@ class UDPReceiver:
                 # Convert to numpy array
                 audio_array = np.frombuffer(pcm_data, dtype=np.int16)
                 audio_float = audio_array.astype(np.float32) / 32767.0
-                
-                # Add to audio queue with overflow protection
+                  # Add to audio queue with enhanced overflow protection
                 with self.queue_lock:
-                    if len(self.audio_queue) < self.max_queue_size:
-                        self.audio_queue.append(audio_float)
+                    # Smart buffer management based on current state
+                    if self.buffer_state == "initializing" or self.buffer_state == "recovering":
+                        # During initialization/recovery, prioritize filling buffer
+                        if len(self.audio_queue) < self.max_queue_size:
+                            self.audio_queue.append(audio_float)
+                            
+                            # Check if we've reached pre-fill threshold
+                            if not self.buffer_prefill_complete and len(self.audio_queue) >= self.prefill_buffer_size:
+                                self.buffer_prefill_complete = True
+                                if self.config['logging']['verbose']:
+                                    print(f"✅ Ultra-fast buffer pre-fill complete: {len(self.audio_queue)} frames")
+                        else:
+                            # Buffer full during init - cycle oldest
+                            self.audio_queue.popleft()
+                            self.audio_queue.append(audio_float)
                     else:
-                        # Drop oldest frame for ultra-low latency
-                        self.audio_queue.popleft()
-                        self.audio_queue.append(audio_float)
-                        self.buffer_overruns += 1
+                        # Normal playback - low-latency management
+                        if len(self.audio_queue) < self.max_queue_size:
+                            self.audio_queue.append(audio_float)
+                        else:
+                            # Drop oldest frame for ultra-low latency
+                            self.audio_queue.popleft()
+                            self.audio_queue.append(audio_float)
+                            self.buffer_overruns += 1
                         
         except Exception as e:
             if self.config['logging']['verbose']:
@@ -746,10 +824,17 @@ class UDPReceiver:
             self.buffer_underruns = 0
             self.audio_glitches = 0
             self.timing_errors = 0
+            self.consecutive_underruns = 0
+            self.buffer_health_score = 100
             self.expected_sequence = 1
             self.sequence_buffer.clear()
             self.start_time = time.perf_counter()
             self.last_audio_time = self.start_time
+            
+            # Initialize buffer state
+            self.buffer_state = "initializing"
+            self.playback_started = False
+            self.buffer_prefill_complete = False
             
             # Set socket timeout for responsive shutdown
             self.sock.settimeout(0.1)
