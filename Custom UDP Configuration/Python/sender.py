@@ -1,3 +1,16 @@
+"""
+UDP Audio Sender with Opus Compression
+
+Packet Format:
+    packet_count: 4 bytes (unsigned long, network byte order)
+    timestamp: 8 bytes (unsigned long long, network byte order) 
+    opus_length: 4 bytes (unsigned long, network byte order)
+    opus_data: variable length (compressed audio)
+
+Total header size: 16 bytes + opus_data
+Compatible with UDPAudioReceiver
+"""
+
 import socket
 import sounddevice as sd
 import threading
@@ -183,7 +196,7 @@ class UDPAudioSender:
         try:
             row = [
                 datetime.now().isoformat(),
-                datetime.fromtimestamp(self.start_time).isoformat(),
+                datetime.fromtimestamp(self.start_time).isoformat() if self.start_time else "Unknown",
                 self.packet_count,
                 elapsed,
                 rate,
@@ -193,12 +206,12 @@ class UDPAudioSender:
                 self.target_ip,
                 self.target_port,
                 self.sample_rate,
-                self.channels,
-                self.opus_bitrate,
+                self.channels,                self.opus_bitrate,
                 self.opus_frame_duration
             ]
             self.csv_writer.writerow(row)
-            self.csv_file_handle.flush()  # Ensure data is written immediately
+            if self.csv_file_handle:
+                self.csv_file_handle.flush()  # Ensure data is written immediately
             
         except Exception as e:
             print(f"Error writing to CSV: {e}")
@@ -211,8 +224,10 @@ class UDPAudioSender:
         if device_id is not None:
             try:
                 device_info = sd.query_devices(device_id)
-                if device_info['max_input_channels'] > 0:
-                    print(f"Using specified device {device_id}: {device_info['name']}")
+                max_channels = getattr(device_info, 'max_input_channels', 0)
+                name = getattr(device_info, 'name', 'Unknown')
+                if max_channels > 0:
+                    print(f"Using specified device {device_id}: {name}")
                     return device_id
             except:
                 print(f"Device {device_id} not found, searching for alternatives")
@@ -220,9 +235,11 @@ class UDPAudioSender:
         # Look for VB-Cable or configured device name
         device_name = self.config['audio']['input_device_name']
         for i, device in enumerate(devices):
-            if device_name.lower() in device['name'].lower():
-                if device['max_input_channels'] > 0:
-                    print(f"Found audio device: {device['name']}")
+            device_name_attr = getattr(device, 'name', '')
+            max_channels = getattr(device, 'max_input_channels', 0)
+            if device_name.lower() in device_name_attr.lower():
+                if max_channels > 0:
+                    print(f"Found audio device: {device_name_attr}")
                     return i
         
         # Fallback to default input
@@ -230,7 +247,8 @@ class UDPAudioSender:
             default_input = sd.default.device[0]
             if default_input is not None:
                 device_info = sd.query_devices(default_input)
-                print(f"Using default input: {device_info['name']}")
+                name = getattr(device_info, 'name', 'Unknown')
+                print(f"Using default input: {name}")
                 return default_input
         except:
             pass
@@ -277,7 +295,7 @@ class UDPAudioSender:
                     # Print stats and log to CSV based on config interval
                     stats_interval = self.config['logging']['stats_interval']
                     if self.packet_count % stats_interval == 0:
-                        elapsed = time.time() - self.start_time
+                        elapsed = time.time() - (self.start_time or time.time())
                         rate = self.packet_count / elapsed
                         compression_ratio = len(pcm_bytes) / len(opus_data)
                         
@@ -344,14 +362,16 @@ class UDPAudioSender:
             self.csv_file_handle = None
             
         print("Audio sender stopped.")
-    
+
     def list_audio_devices(self):
         """List available audio devices"""
         print("Available audio devices:")
         devices = sd.query_devices()
         for i, device in enumerate(devices):
-            if device['max_input_channels'] > 0:
-                print(f"  {i}: {device['name']} (inputs: {device['max_input_channels']})")
+            max_channels = getattr(device, 'max_input_channels', 0)
+            name = getattr(device, 'name', 'Unknown')
+            if max_channels > 0:
+                print(f"  {i}: {name} (inputs: {max_channels})")
 
 
 if __name__ == "__main__":

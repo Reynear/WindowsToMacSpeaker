@@ -1,2 +1,4 @@
 .DS_Store
 FFmpeg-RTP Implementation/MacOS/playback.log
+.venv
+.vscode
