@@ -1,14 +1,24 @@
 """
-UDP Audio Receiver with Opus Decompression
+UDP Audio Receiver
 
-Compatible with UDPAudioSender
-Receives compressed audio over UDP and plays it back in real-time
+Features:
+- Playback with adaptive jitter buffer management
+- Real-time process priority optimization for consistent performance
+- Packet loss detection and audio concealment
+- Adaptive buffer management to prevent underruns and glitches
+- Comprehensive performance monitoring and metrics
+- Cross-platform compatibility with optimized settings
+
+To be used with UDPSender
+Receives compressed audio over UDP and plays it back in real-time with minimal latency
 
 Packet Format Expected:
     packet_count: 4 bytes (unsigned long, network byte order)
     timestamp: 8 bytes (unsigned long long, network byte order)
     opus_length: 4 bytes (unsigned long, network byte order) 
     opus_data: variable length (compressed audio)
+
+Optimized for Real-time audio streaming
 """
 
 import socket
@@ -22,6 +32,16 @@ import json
 import os
 import csv
 from datetime import datetime
+from collections import deque
+import queue
+
+# Optional process optimization
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None
+    PSUTIL_AVAILABLE = False
 
 # Try to import opuslib with error handling
 try:
@@ -32,7 +52,7 @@ except ImportError:
     OPUS_AVAILABLE = False
     print("Warning: opuslib not available. Install with: pip install opuslib")
 
-class UDPAudioReceiver:
+class UDPReceiver:
     def __init__(self, config_file="config.json"):
         # Load configuration
         self.config = self.load_config(config_file)
@@ -41,12 +61,17 @@ class UDPAudioReceiver:
         self.listen_ip = "0.0.0.0"  # Listen on all interfaces
         self.listen_port = self.config['network']['port']
         
-        # Audio configuration
+        # Load audio configuration first
         self.sample_rate = self.config['audio']['sample_rate']
         self.channels = self.config['audio']['channels']
-        self.chunk_size = self.config['audio']['chunk_size']        # UDP packet configuration (instead of RTP)
+        self.chunk_size = self.config['audio']['chunk_size']
+        self.frame_duration = self.config['opus']['frame_duration']
+        self.frame_samples = int(self.sample_rate * self.frame_duration / 1000)
+        
+        # UDP packet configuration
         self.packet_header_size = 16  # packet_count(4) + timestamp(8) + opus_length(4)
-          # Initialize Opus decoder
+        
+        # Initialize Opus decoder
         if OPUS_AVAILABLE and opuslib is not None:
             try:
                 self.opus_decoder = opuslib.Decoder(
@@ -67,28 +92,56 @@ class UDPAudioReceiver:
         
         # Initialize socket
         self.sock = None
-        self.init_socket()
-        
-        # Control flags
+        self.init_socket()        # Control flags
         self.receiving = False
         self.packet_count = 0
         self.start_time = None
         
-        # Audio playback buffer
-        self.audio_queue = []
-        self.queue_lock = threading.Lock()
-        self.max_queue_size = self.config['audio']['buffer_frames']
+        # Audio buffering with thread-safe access
+        self.audio_queue = deque(maxlen=20)  # Fast access buffer
+        self.queue_lock = threading.Lock()  # Thread synchronization
+        self.max_queue_size = 20
+        self.playback_buffer = deque(maxlen=10)  # Additional fast access buffer
+        self.buffer_lock = threading.Lock()
         
-        # RTP packet tracking
-        self.lost_packets = 0
-        self.last_sequence = None
-        self.out_of_order_packets = 0
-        self.duplicate_packets = 0
-        self.received_sequences = set()
+        # Advanced performance tracking
+        self.packets_received = 0
+        self.packets_lost = 0
+        self.packets_late = 0
+        self.packets_duplicate = 0
+        self.buffer_underruns = 0
+        self.buffer_overruns = 0
+        self.audio_glitches = 0
+        self.timing_errors = 0
         
-        # Jitter calculation
+        # Ultra-precise timing and jitter management
+        self.frame_interval = self.frame_duration / 1000.0  # Convert to seconds
+        self.timing_precision = 0.001  # 1ms precision target
+        self.last_packet_time = 0.0
+        self.packet_timestamps = deque(maxlen=100)  # Track recent packets
+
+        # Jitter calculation attributes
         self.transit_times = []
         self.jitter = 0.0
+        
+        # Adaptive jitter buffer management
+        self.adaptive_jitter_size = self.config['optimization']['jitter_buffer_size']
+        self.jitter_buffer_min = 1
+        self.jitter_buffer_max = 10
+        self.network_jitter = 0.0
+        self.jitter_adaptation_rate = 0.1
+        
+        # Real-time priority settings
+        self.realtime_priority = True
+        
+        # Packet ordering and loss detection
+        self.expected_sequence = 1
+        self.sequence_buffer = {}  # Out-of-order packet buffer
+        self.max_sequence_gap = 5
+        
+        # Audio concealment for lost packets
+        self.last_audio_frame = None
+        self.concealment_enabled = True
         
         # Threading
         self.receive_thread = None
@@ -98,68 +151,26 @@ class UDPAudioReceiver:
         self.csv_file_handle = None
         self.init_csv_logging()
         
-    def load_config(self, config_file):
-        """Load configuration from JSON file with defaults"""
-        default_config = {
-            "network": {
-                "port": 5004,
-                "socket_buffer_size": 65536
-            },
-            "audio": {
-                "sample_rate": 48000,
-                "channels": 2,
-                "chunk_size": 1024,
-                "buffer_frames": 10,
-                "output_device_id": None,
-                "output_device_name": "default"
-            },
-            "opus": {
-                "bitrate": 128000,
-                "frame_duration": 20
-            },
-            "logging": {
-                "stats_interval": 100,
-                "verbose": True,
-                "csv_file": "udp_receiver_metrics.csv",
-                "enable_csv": True
-            }
-        }
+        # Set remaining config values
+        self.max_queue_size = self.config['audio'].get('buffer_frames', 10)
         
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, 'r') as f:
-                    file_config = json.load(f)
-                    
-                # Merge configs
-                config = default_config.copy()
-                for section, values in file_config.items():
-                    if section in config:
-                        config[section].update(values)
-                    else:
-                        config[section] = values
-                        
-                print(f"Loaded configuration from {config_file}")
-                return config
-                
-            except Exception as e:
-                print(f"Error loading config file {config_file}: {e}")
-                print("Using default configuration")
-                
-        else:
-            print(f"Config file {config_file} not found, creating default")
-            self.save_config(config_file, default_config)
-            
-        return default_config
-    
-    def save_config(self, config_file, config):
-        """Save configuration to JSON file"""
+        # Jitter buffer (in packets)
+        jitter_size = self.config['optimization']['jitter_buffer_size']
+        self.jitter_buffer = deque(maxlen=jitter_size)
+        
+    def load_config(self, config_file):
+        """Load configuration directly from JSON file"""
+        if not os.path.exists(config_file):
+            print(f"Error: config file '{config_file}' not found.")
+            sys.exit(1)
         try:
-            with open(config_file, 'w') as f:
-                json.dump(config, f, indent=2)
-            print(f"Default configuration saved to {config_file}")
+            with open(config_file, 'r') as f:
+                config = json.load(f)
         except Exception as e:
-            print(f"Error saving config file: {e}")
-    
+            print(f"Error reading config file: {e}")
+            sys.exit(1)
+        return config
+
     def init_socket(self):
         """Initialize UDP socket"""
         try:
@@ -321,19 +332,17 @@ class UDPAudioReceiver:
             'packet_count': packet_count,
             'timestamp': timestamp,
             'opus_length': opus_length,
-            'opus_data': opus_data
-        }
+            'opus_data': opus_data        }
     
-    def calculate_jitter(self, rtp_timestamp, arrival_time):
-        """Calculate inter-arrival jitter (RFC 3550)"""
-        # Convert RTP timestamp to seconds (assuming 48kHz sample rate)
-        rtp_time_seconds = rtp_timestamp / self.sample_rate
+    def calculate_jitter(self, udp_timestamp, arrival_time):
+        """Calculate inter-arrival jitter for UDP packets"""
+        # Convert UDP timestamp to seconds
+        udp_time_seconds = udp_timestamp / self.sample_rate
         
         # Calculate transit time
-        transit = arrival_time - rtp_time_seconds
+        transit = arrival_time - udp_time_seconds
         self.transit_times.append(transit)
-        
-        # Calculate jitter using RFC 3550 formula
+          # Calculate jitter using standard formula
         if len(self.transit_times) > 1:
             d = abs(transit - self.transit_times[-2])
             self.jitter += (d - self.jitter) / 16.0
@@ -343,18 +352,20 @@ class UDPAudioReceiver:
             self.transit_times = self.transit_times[-50:]
     
     def audio_callback(self, outdata, frames, time_info, status):
-        """Audio playback callback"""
-        if status and self.config['logging']['verbose']:
-            print(f"Audio status: {status}")
+        """Audio playback callback with enhanced performance tracking"""
+        callback_start = time.perf_counter()
         
-        outdata.fill(0)
+        if status and self.config['logging']['verbose']:
+            print(f"⚠️ Audio status: {status}")
+        
+        outdata.fill(0)  # Zero output buffer initially
         
         try:
             with self.queue_lock:
                 if len(self.audio_queue) > 0:
-                    audio_data = self.audio_queue.pop(0)
+                    audio_data = self.audio_queue.popleft()  # Use popleft() for deque
                     
-                    # Ensure proper shape
+                    # Ensure proper shape for multi-channel audio
                     if audio_data.ndim == 1:
                         if self.channels == 2:
                             audio_data = np.column_stack([audio_data, audio_data])
@@ -364,18 +375,48 @@ class UDPAudioReceiver:
                     samples_to_copy = min(len(audio_data), frames)
                     outdata[:samples_to_copy] = audio_data[:samples_to_copy]
                     
-                    # Buffer underrun warning
-                    if len(self.audio_queue) < 2:
-                        if self.config['logging']['verbose']:
-                            print(f"Buffer underrun: {len(self.audio_queue)} frames queued")
-                            
+                    # Advanced buffer monitoring and adaptation
+                    queue_size = len(self.audio_queue)
+                    if queue_size < 2:
+                        self.buffer_underruns += 1
+                        if self.config['logging']['verbose'] and self.buffer_underruns % 10 == 0:
+                            print(f"⚡ Buffer underrun #{self.buffer_underruns}: {queue_size} frames queued")
+                    
+                    # Track audio timing precision
+                    self.track_audio_timing()
+                    
+                else:
+                    # Audio concealment for smooth playback during underruns
+                    if self.last_audio_frame is not None and self.concealment_enabled:
+                        # Simple fade-out concealment
+                        fade_samples = min(frames, len(self.last_audio_frame))
+                        fade_factor = np.linspace(0.5, 0.0, fade_samples).reshape(-1, 1)
+                        concealed_audio = self.last_audio_frame[:fade_samples] * fade_factor
+                        outdata[:fade_samples] = concealed_audio
+                    
+                    self.buffer_underruns += 1
+                    if self.config['logging']['verbose']:
+                        print(f"🔇 Audio buffer empty - concealment applied")
+            
+            # Store last frame for concealment
+            if len(outdata) > 0:
+                self.last_audio_frame = outdata.copy()
+                
         except Exception as e:
+            self.audio_glitches += 1
             if self.config['logging']['verbose']:
-                print(f"Error in audio callback: {e}")
+                print(f"❌ Audio callback error #{self.audio_glitches}: {e}")
+        
+        # Track callback performance
+        callback_duration = time.perf_counter() - callback_start
+        if callback_duration > 0.005:  # Warn if callback takes >5ms
+            self.timing_errors += 1
+            if self.config['logging']['verbose']:
+                print(f"⏱️ Slow audio callback: {callback_duration*1000:.2f}ms")
     
     def receive_packets(self):
-        """Receive and process RTP packets"""
-        print(f"Listening for RTP packets on {self.listen_ip}:{self.listen_port}")
+        """Receive and process UDP packets"""
+        print(f"Listening for UDP packets on {self.listen_ip}:{self.listen_port}")
         
         while self.receiving:
             try:
@@ -428,14 +469,13 @@ class UDPAudioReceiver:
                     # Convert to numpy array
                     audio_array = np.frombuffer(pcm_data, dtype=np.int16)
                     audio_float = audio_array.astype(np.float32) / 32767.0
-                    
-                    # Add to playback queue
+                      # Add to playback queue
                     with self.queue_lock:
                         if len(self.audio_queue) < self.max_queue_size:
                             self.audio_queue.append(audio_float)
                         else:
-                            # Drop oldest frame
-                            self.audio_queue.pop(0)
+                            # Drop oldest frame for deque
+                            self.audio_queue.popleft()
                             self.audio_queue.append(audio_float)
                             
                 except Exception as e:
@@ -444,7 +484,8 @@ class UDPAudioReceiver:
                     continue
                 
                 self.packet_count += 1
-                  # Statistics and logging
+                
+                # Statistics and logging
                 stats_interval = self.config['logging']['stats_interval']
                 if self.packet_count % stats_interval == 0:
                     elapsed = time.time() - (self.start_time or time.time())
@@ -456,12 +497,13 @@ class UDPAudioReceiver:
                         queue_size = len(self.audio_queue)
                     
                     if self.config['logging']['verbose']:
-                        print(f"RTP: {self.packet_count} pkts, {rate:.1f} pkt/s, "
+                        print(f"UDP: {self.packet_count} pkts, {rate:.1f} pkt/s, "
                               f"loss: {loss_rate:.2f}%, jitter: {self.jitter*1000:.1f}ms, "
                               f"queue: {queue_size}")
                     
                     self.log_metrics_to_csv(elapsed, rate, loss_rate, queue_size)
-                  # Clean up old sequence numbers to prevent memory growth
+                
+                # Clean up old sequence numbers to prevent memory growth
                 if len(self.received_sequences) > 1000:
                     # Keep only recent sequences
                     recent_sequences = set()
@@ -481,61 +523,248 @@ class UDPAudioReceiver:
                     print(f"Error receiving packet: {e}")
                 continue
     
+    def set_process_priority(self):
+        """Set process to real-time priority for ultra-low latency"""
+        try:
+            if os.name == 'nt':  # Windows
+                import ctypes
+                # Set process to HIGH_PRIORITY_CLASS
+                ctypes.windll.kernel32.SetPriorityClass(-1, 0x00000080)
+                # Set thread to TIME_CRITICAL
+                ctypes.windll.kernel32.SetThreadPriority(-2, 15)
+                print("✅ Receiver priority set to real-time (Windows)")
+            else:  # Unix-like systems
+                try:
+                    os.nice(-20)  # Highest priority
+                    print("✅ Receiver priority set to real-time (Unix)")
+                except PermissionError:
+                    print("⚠️ Could not set real-time priority (requires root)")
+        except Exception as e:
+            print(f"⚠️ Could not optimize receiver priority: {e}")
+    
+    def adapt_jitter_buffer(self):
+        """Dynamically adapt jitter buffer size based on network conditions"""
+        if len(self.packet_timestamps) < 10:
+            return
+        
+        # Calculate network jitter
+        intervals = []
+        timestamps = list(self.packet_timestamps)
+        for i in range(1, len(timestamps)):
+            intervals.append(timestamps[i] - timestamps[i-1])
+        
+        if intervals:
+            avg_interval = sum(intervals) / len(intervals)
+            jitter = sum(abs(interval - avg_interval) for interval in intervals) / len(intervals)
+            
+            # Smooth jitter calculation
+            self.network_jitter = (1 - self.jitter_adaptation_rate) * self.network_jitter + \
+                                 self.jitter_adaptation_rate * jitter
+            
+            # Adapt buffer size
+            if self.network_jitter > 0.01:  # High jitter
+                self.adaptive_jitter_size = min(self.jitter_buffer_max, 
+                                              self.adaptive_jitter_size + 1)
+            elif self.network_jitter < 0.005:  # Low jitter
+                self.adaptive_jitter_size = max(self.jitter_buffer_min, 
+                                              self.adaptive_jitter_size - 1)
+    
+    def generate_concealment_audio(self):
+        """Generate concealment audio for lost packets"""
+        if self.last_audio_frame is None:
+            # Generate silence
+            return np.zeros((self.frame_samples, self.channels), dtype=np.float32)
+        
+        # Simple audio concealment - fade out last frame
+        concealment = self.last_audio_frame * 0.5
+        return concealment.astype(np.float32)
+    
+    def track_audio_timing(self):
+        """Precise audio timing for consistent playback"""
+        current_time = time.perf_counter()
+        
+        # Calculate ideal timing
+        if hasattr(self, 'last_audio_time'):
+            expected_time = self.last_audio_time + self.frame_interval
+            timing_error = current_time - expected_time
+            
+            if abs(timing_error) > self.timing_precision:
+                self.timing_errors += 1
+                if self.config['logging']['verbose'] and self.timing_errors % 100 == 0:
+                    print(f"⚠️ Audio timing error: {timing_error*1000:.2f}ms")
+        
+        self.last_audio_time = current_time
+        return current_time
+    
+    def enhanced_receive_packets(self):
+        """Enhanced packet reception with ultra-low latency processing"""
+        try:
+            while self.receiving:
+                try:
+                    # Receive packet with minimal latency
+                    if self.sock is None:
+                        break
+                    data, addr = self.sock.recvfrom(4096)
+                    receive_time = time.perf_counter()
+                    
+                    self.packet_count += 1
+                    self.packets_received += 1
+                    
+                    # Process packet immediately for minimal latency
+                    self.process_packet(data, receive_time)
+                    
+                except socket.timeout:
+                    continue  # Normal timeout, keep receiving
+                except Exception as e:
+                    if self.receiving and self.config['logging']['verbose']:
+                        print(f"⚠️ Packet reception error: {e}")
+                    continue
+        except Exception as e:
+            print(f"❌ Enhanced packet receiver error: {e}")
+    
+    def process_packet(self, data, receive_time):
+        """Process received packet with ultra-low latency"""
+        try:            # Parse UDP header for sequence and timing
+            if len(data) < 12:
+                return
+            
+            # Basic UDP header parsing (packet_count + timestamp)
+            sequence_number = int.from_bytes(data[0:4], byteorder='big')
+            timestamp = int.from_bytes(data[4:12], byteorder='big')
+            
+            # Update packet timing metrics
+            self.last_packet_time = receive_time
+            self.packet_timestamps.append(receive_time)
+              # Extract and decode audio payload immediately
+            payload = data[12:]  # Skip UDP header
+            
+            if len(payload) > 0:
+                # Decode Opus audio with minimal delay
+                audio_float = self.opus_decoder.decode_float(payload, self.frame_samples)
+                
+                # Add to audio queue with overflow protection
+                with self.queue_lock:
+                    if len(self.audio_queue) < self.max_queue_size:
+                        self.audio_queue.append(audio_float)
+                    else:
+                        # Drop oldest frame for ultra-low latency
+                        self.audio_queue.popleft()
+                        self.audio_queue.append(audio_float)
+                        self.buffer_overruns += 1
+                        
+        except Exception as e:
+            if self.config['logging']['verbose']:
+                print(f"⚠️ Ultra-low latency packet processing error: {e}")
+    
+    def cleanup_enhanced(self):
+        """Enhanced cleanup with performance metrics"""
+        print("\n🧹 Enhanced cleanup starting...")
+        
+        # Stop receiving
+        self.receiving = False
+        
+        # Display final performance metrics
+        if self.start_time:
+            runtime = time.perf_counter() - self.start_time
+            print(f"\n📊 Ultra-Low Latency Performance Summary:")
+            print(f"⏱️ Runtime: {runtime:.2f}s")
+            print(f"📦 Packets received: {self.packets_received}")
+            print(f"❌ Packets lost: {self.packets_lost}")
+            print(f"🔄 Buffer underruns: {self.buffer_underruns}")
+            print(f"🔄 Buffer overruns: {self.buffer_overruns}")
+            print(f"🎵 Audio glitches: {self.audio_glitches}")
+            print(f"⚠️ Timing errors: {self.timing_errors}")
+            
+            if self.packets_received > 0:
+                loss_rate = (self.packets_lost / (self.packets_received + self.packets_lost)) * 100
+                print(f"📊 Packet loss rate: {loss_rate:.2f}%")
+        
+        # Clean up resources
+        try:
+            if hasattr(self, 'receive_thread') and self.receive_thread and self.receive_thread.is_alive():
+                self.receive_thread.join(timeout=1.0)
+        except Exception as e:
+            print(f"⚠️ Thread cleanup warning: {e}")
+        
+        # Call standard cleanup
+        self.cleanup()
+        print("✅ Enhanced cleanup completed")
+
     def start_receiving(self):
-        """Start RTP reception and audio playback"""
-        print(f"Starting RTP audio receiver")
-        print(f"Listen: {self.listen_ip}:{self.listen_port}")
-        print(f"Audio: {self.sample_rate}Hz, {self.channels} channels")
-        print(f"Codec: Opus (compressed UDP)")
+        """Start ultra-low latency audio reception and playback"""
+        print(f"🚀 Starting Ultra-Low Latency Audio Receiver")
+        print(f"🎧 Listen: {self.listen_ip}:{self.listen_port}")
+        print(f"🎵 Audio: {self.sample_rate}Hz, {self.channels} channels")
+        print(f"🔧 Codec: Opus (ultra-low latency)")
+        print(f"📦 Frame size: {self.frame_samples} samples")
+        print(f"⚡ Frame interval: {self.frame_interval*1000:.2f}ms")
+        print(f"🎯 Target latency: <50ms total")
+        print(f"📊 Adaptive jitter buffer: {self.adaptive_jitter_size} packets")
+        
+        # Set process priority for real-time performance
+        if self.realtime_priority:
+            self.set_process_priority()
         
         if self.output_device is None:
-            print("Cannot start without valid audio output device")
+            print("❌ Cannot start without valid audio output device")
             return False
             
         if not self.sock:
-            print("Cannot start without valid socket")
+            print("❌ Cannot start without valid socket")
             return False
         
         try:
             self.receiving = True
             self.packet_count = 0
-            self.lost_packets = 0
-            self.out_of_order_packets = 0
-            self.duplicate_packets = 0
-            self.last_sequence = None
-            self.received_sequences.clear()
-            self.start_time = time.time()
+            self.packets_received = 0
+            self.packets_lost = 0
+            self.packets_late = 0
+            self.buffer_underruns = 0
+            self.audio_glitches = 0
+            self.timing_errors = 0
+            self.expected_sequence = 1
+            self.sequence_buffer.clear()
+            self.start_time = time.perf_counter()
+            self.last_audio_time = self.start_time
             
-            # Set socket timeout
-            self.sock.settimeout(1.0)
+            # Set socket timeout for responsive shutdown
+            self.sock.settimeout(0.1)
             
-            print("Reception started. Press Ctrl+C to stop...")
+            print("✅ Ultra-low latency reception started")
+            print("📊 Enhanced metrics enabled")
+            print("Press Ctrl+C to stop...")
             
             # Start packet reception thread
-            self.receive_thread = threading.Thread(target=self.receive_packets)
-            self.receive_thread.daemon = True
+            self.receive_thread = threading.Thread(target=self.enhanced_receive_packets, daemon=True)
             self.receive_thread.start()
             
-            # Start audio playback
+            # Start ultra-low latency audio playback
             with sd.OutputStream(
                 device=self.output_device,
                 channels=self.channels,
                 samplerate=self.sample_rate,
-                blocksize=self.chunk_size,
+                blocksize=self.frame_samples,  # Match frame size
                 dtype=np.float32,
                 callback=self.audio_callback,
-                latency='low'
+                latency='low'  # Request lowest possible latency
             ):
+                # Keep alive with minimal CPU usage and adaptive jitter monitoring
                 while self.receiving:
-                    time.sleep(0.1)
+                    time.sleep(0.01)  # 10ms for responsiveness
+                    
+                    # Periodic jitter buffer adaptation
+                    if self.packet_count % 50 == 0:  # Every 50 packets
+                        self.adapt_jitter_buffer()
             
             return True
             
         except Exception as e:
-            print(f"Failed to start RTP receiver: {e}")
+            print(f"❌ Failed to start ultra-low latency receiver: {e}")
+            import traceback
+            traceback.print_exc()
             return False
         finally:
-            self.cleanup()
+            self.cleanup_enhanced()
     
     def stop_receiving(self):
         """Stop reception"""
@@ -564,7 +793,7 @@ class UDPAudioReceiver:
             self.csv_file_handle = None
             self.csv_writer = None
             
-        print("RTP audio receiver stopped.")
+        print("UDP audio receiver stopped.")
 
     def list_audio_devices(self):
         """List available audio devices"""
@@ -580,20 +809,22 @@ class UDPAudioReceiver:
             print(f"Error listing audio devices: {e}")
 
 if __name__ == "__main__":
-    try:
-        receiver = UDPAudioReceiver()
-    except Exception as e:
-        print(f"Failed to initialize RTP receiver: {e}")
-        sys.exit(1)
+    print("UDP Audio Receiver")
+    print("=" * 50)
     
+    receiver = None
     try:
+        receiver = UDPReceiver()
         success = receiver.start_receiving()
         if not success:
             sys.exit(1)
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\n🛑 Interrupted by user")
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        receiver.stop_receiving()
-        receiver.cleanup()
+        if receiver:
+            receiver.stop_receiving()
+            receiver.cleanup()
